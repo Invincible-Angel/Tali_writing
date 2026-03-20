@@ -58,11 +58,15 @@
     // --- API Configuration ---
     // (不再寫死金鑰，改由畫面登入時填寫)
 
+    // ✨ 新增：建立前端快取記憶體 (取代 Redis)，減少重複請求消耗 API 額度 ✨
+    const responseCache = new Map();
+
     // --- 輔助函數：呼叫 Gemini API ---
     const generateAIResponse = async (prompt, apiKey, isJSON = false) => {
       if (!apiKey) {
         const errMsg = "請先綁定有效的 API Key！";
-        return isJSON ? { praise: "系統設定錯誤", revised: "尚未設定金鑰", reason: errMsg } : `⚠️ ${errMsg}`;
+        // ✨ 加入 isError: true 標記，讓介面知道這是一個錯誤 ✨
+        return isJSON ? { isError: true, praise: "系統設定錯誤", revised: "尚未設定金鑰", reason: errMsg } : `⚠️ ${errMsg}`;
       }
 
       // ✨ 升級模型：全面改用最新版 gemini-2.5-flash 解決找不到舊模型的錯誤 ✨
@@ -70,6 +74,13 @@
       const modelName = isCanvas ? "gemini-2.5-flash-preview-09-2025" : "gemini-2.5-flash";
       const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
       
+      // ✨ 快取機制：發送請求前先檢查快取，相同問題直接秒回 ✨
+      const cacheKey = `${modelName}_${prompt}_${isJSON}`;
+      if (responseCache.has(cacheKey)) {
+        console.log("✨ 命中快取，節省一次 API 請求額度！");
+        return responseCache.get(cacheKey);
+      }
+
       const payload = {
         contents: [{ parts: [{ text: prompt }] }],
         systemInstruction: {
@@ -85,6 +96,7 @@
         };
       }
 
+      // 實作指數退避演算法 (Exponential Backoff)
       const retries = 5;
       const delays = [1000, 2000, 4000, 8000, 16000];
 
@@ -99,15 +111,26 @@
           const data = await response.json();
           
           if (!response.ok) {
+            // ✨ 智慧退避邏輯：如果是 400, 403 這種不該重試的錯誤，直接中斷。只在 429(Too Many Requests) 流量超載時才等待並重試 ✨
+            if (response.status >= 400 && response.status < 500 && response.status !== 429) {
+               const abortErr = new Error(data.error?.message || `請求錯誤 (狀態碼: ${response.status})`);
+               abortErr.isAbort = true; // 標記為不可重試的錯誤
+               throw abortErr;
+            }
             throw new Error(data.error?.message || `未知的伺服器錯誤 (狀態碼: ${response.status})`);
           }
           
           const textResponse = data.candidates?.[0]?.content?.parts?.[0]?.text;
-          return isJSON ? JSON.parse(textResponse) : textResponse;
+          const finalResult = isJSON ? JSON.parse(textResponse) : textResponse;
+          
+          // ✨ 將成功結果存入快取 ✨
+          responseCache.set(cacheKey, finalResult);
+          return finalResult;
           
         } catch (error) {
-          if (i === retries - 1) {
-            console.error("Gemini API Error after retries:", error);
+          // 如果是不可重試的錯誤，或是已經達到最大重試次數，就直接放棄
+          if (error.isAbort || i === retries - 1) {
+            console.error("Gemini API Error after retries/aborts:", error);
             const errorMessage = error.message || "未知錯誤";
             
             // ✨ 針對 Failed to fetch 給出具體的排錯建議 ✨
@@ -119,8 +142,9 @@
                 chatText = "哎呀！小火龍老師的網路被擋住了（Failed to fetch）！Angel，這通常是因為「廣告攔截器阻擋」或是「API金鑰限制了網站」造成的喔，請幫忙檢查一下！";
             }
 
+            // ✨ 加入 isError: true 標記 ✨
             return isJSON 
-              ? { praise: "網路連線被擋住了", revised: "連線失敗", reason: reasonText }
+              ? { isError: true, praise: "網路連線被擋住了", revised: "連線失敗", reason: reasonText }
               : chatText;
           }
           await new Promise(resolve => setTimeout(resolve, delays[i]));
@@ -301,6 +325,7 @@
 
       const finishDraft = async () => {
         setStep(4);
+        setReviewResult(null); // ✨ 每次重新批改前先清空舊結果，確保顯示讀取動畫 ✨
         setIsLoading(true);
         
         const prompt = `請批改塔莉寫的「${goal}」。
@@ -693,8 +718,12 @@ ${data.reason}
                   )}
 
                   <h2 className="text-2xl font-black text-center text-gray-800 mb-8 flex items-center justify-center gap-2 drop-shadow-sm">
-                    <CheckCircle2 className="w-8 h-8 text-green-500" />
-                    {step === 4 ? "任務完成！" : "滿分作品回顧"}
+                    {step === 4 && reviewResult?.isError ? (
+                      <span className="text-3xl">⚠️</span>
+                    ) : (
+                      <CheckCircle2 className="w-8 h-8 text-green-500" />
+                    )}
+                    {step === 4 ? (reviewResult?.isError ? "遇到一點小問題" : "任務完成！") : "滿分作品回顧"}
                   </h2>
                   
                   {(!reviewResult && step === 4) ? (
@@ -752,28 +781,49 @@ ${data.reason}
                                 <div className="text-sm font-bold text-green-600 mb-2 ml-2 flex items-center gap-1">
                                   ✨ 小火龍潤飾版：
                                 </div>
-                                <div className="bg-white rounded-2xl p-6 text-gray-800 text-[16px] font-medium leading-relaxed shadow-md border-2 border-green-200 relative overflow-hidden">
-                                  <div className="absolute top-0 right-0 w-20 h-20 bg-gradient-to-bl from-green-100 to-transparent rounded-bl-full opacity-50 -z-10"></div>
+                                <div className={`bg-white rounded-2xl p-6 text-gray-800 text-[16px] font-medium leading-relaxed shadow-md border-2 relative overflow-hidden ${data.isError ? 'border-red-200' : 'border-green-200'}`}>
+                                  <div className={`absolute top-0 right-0 w-20 h-20 rounded-bl-full opacity-50 -z-10 ${data.isError ? 'bg-gradient-to-bl from-red-100 to-transparent' : 'bg-gradient-to-bl from-green-100 to-transparent'}`}></div>
                                   {data.revised}
                                 </div>
                               </div>
                             </div>
 
                             <div className="flex gap-3 mt-10">
-                              <button 
-                                onClick={() => handleSaveArticle(data)}
-                                className="flex-1 py-4 bg-gradient-to-b from-blue-400 to-blue-500 text-white font-bold text-lg rounded-2xl shadow-[0_4px_0_0_#1e3a8a] active:shadow-none active:translate-y-1 transition-all flex justify-center items-center gap-2"
-                              >
-                                <Download className="w-5 h-5" />
-                                儲存文章
-                              </button>
+                              {data.isError ? (
+                                <button 
+                                  onClick={finishDraft}
+                                  className="flex-1 py-4 bg-gradient-to-b from-orange-400 to-orange-500 text-white font-bold text-lg rounded-2xl shadow-[0_4px_0_0_#c2410c] active:shadow-none active:translate-y-1 transition-all flex justify-center items-center gap-2"
+                                >
+                                  <RotateCcw className="w-5 h-5" />
+                                  重新嘗試批改
+                                </button>
+                              ) : (
+                                <button 
+                                  onClick={() => handleSaveArticle(data)}
+                                  className="flex-1 py-4 bg-gradient-to-b from-blue-400 to-blue-500 text-white font-bold text-lg rounded-2xl shadow-[0_4px_0_0_#1e3a8a] active:shadow-none active:translate-y-1 transition-all flex justify-center items-center gap-2"
+                                >
+                                  <Download className="w-5 h-5" />
+                                  儲存文章
+                                </button>
+                              )}
                               
                               {step === 4 && (
                                 <button 
-                                  onClick={() => setStep(0)} 
-                                  className="flex-1 py-4 bg-gradient-to-b from-red-400 to-red-500 text-white font-bold text-lg rounded-2xl shadow-[0_4px_0_0_#7f1d1d] active:shadow-none active:translate-y-1 transition-all flex justify-center items-center"
+                                  onClick={() => {
+                                    if (data.isError) {
+                                      setStep(3); // 返回草稿對話區
+                                      setReviewResult(null);
+                                    } else {
+                                      setStep(0); // 成功則回首頁
+                                    }
+                                  }} 
+                                  className={`flex-1 py-4 text-white font-bold text-lg rounded-2xl active:shadow-none active:translate-y-1 transition-all flex justify-center items-center ${
+                                    data.isError 
+                                      ? "bg-gradient-to-b from-gray-400 to-gray-500 shadow-[0_4px_0_0_#374151]" 
+                                      : "bg-gradient-to-b from-red-400 to-red-500 shadow-[0_4px_0_0_#7f1d1d]"
+                                  }`}
                                 >
-                                  回首頁
+                                  {data.isError ? "返回修改草稿" : "回首頁"}
                                 </button>
                               )}
                             </div>
